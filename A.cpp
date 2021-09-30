@@ -29,8 +29,8 @@ std::array<Eigen::MatrixX3d, 4> PickEdge(const Eigen::Matrix<Eigen::Vector3d, Ei
 	}
 	return ret;
 }
-int GetP2Rotate(int p1r, int p1e, int p2e) {
-	return (p1r + p1e + p2e + 2) % 4;
+pair<Point, int> GetP2PosAndRotate(const Point& p1, int p1r, int p1e, int p2e) {
+	return make_pair<Point, int>(p1 + s3d::Array<Point>{ Point::Up(), Point::Right(), Point::Down(), Point::Left() }[(p1r + p1e) % 4], (p1r + p1e + p2e + 2) % 4);
 }
 
 class PPMInfo {
@@ -60,7 +60,7 @@ public:
 };
 
 struct Graph {
-	Point p;
+	Point suffledpos;
 	int r;
 };
 
@@ -78,76 +78,98 @@ void Main()
 	const auto mat_tiles = (tiles >> [](const auto& image) {return ImageToMatrix(image); });
 	const Grid<std::array<Eigen::MatrixX3d, 4>> edge = (mat_tiles >> [](const auto& mat) {return PickEdge(mat); });
 
-	struct P {
+	struct ScoreData {
 		Point p1, p2;
-		int r1, r2;
+		int e1, e2;
 		double score;
 	};
 	const auto score_calc = [&](const Point& p1, int d1, const Point& p2, int d2) {
 		return (edge[p1][d1] - edge[p2][d2].colwise().reverse()).rowwise().squaredNorm().sum();
 	};
-	s3d::Array<P> scorearray;
+	s3d::Array<ScoreData> scorearray;
 	for (auto i : step(tiles.size())) {
 		for (auto j : step(tiles.size())) {
 			if (i.x < j.x or i.x == j.x and i.y < j.y) {
 				for(auto k : step(4)) {
 					for (int l : step(4)) {
-						scorearray << (P{ i,j,k,l,score_calc(i,k,j,l) });
+						scorearray << (ScoreData{ i,j,k,l,score_calc(i,k,j,l) });
 					}
 				}
 			}
 		}
 	}
 	scorearray.sort_by([](const auto& a, const auto& b) {return a.score < b.score; });
-	list<P> scorelist(scorearray.begin(), scorearray.end());
+	list<ScoreData> scorelist(scorearray.begin(), scorearray.end());
 
 	{	//textfile output
 		TextWriter writer(U"Banana.txt");
 		for (const auto& i : scorelist)
-			writer.writeln(U"{},{},{},{},{}"_fmt(i.p1, i.p2, i.r1, i.r2, i.score));
+			writer.writeln(U"{},{},{},{},{}"_fmt(i.p1, i.p2, i.e1, i.e2, i.score));
 	}
 
-	s3d::Array<shared_ptr<Graph>> nodes;
-	Grid<weak_ptr<Graph>> graph;
-	for (const auto& [p1, p2, d1, d2, score] : scorelist) {
-		auto&& i1 = *find_if(graph.begin(), graph.end(), [&](const shared_ptr<Graph>& node) {return node->p == p1; });
-		auto&& i2 = *find_if(graph.begin(), graph.end(), [&](const shared_ptr<Graph>& node) {return node->p == p2; });
+	Grid<Optional<Graph>> graph(32, 32);	//operator[]にはグラフ座標
+	Grid<Point> TilePToGraphP(tiles.size());
+	s3d::Array<Point> used;	//位置が決定したタイル座標
+	graph[{15, 15}] = Graph{ scorelist.front().p1,0 };
+	TilePToGraphP[scorelist.front().p1] = Point(15, 15);
+	used << scorelist.front().p1;
 
+	const auto updategraph = [&]() {
+		Optional<s3d::Array<ScoreData>::iterator> minscore;
+		for (const auto& i : used) {
+			Logger << U"タイル{},グラフ{}の周りを探します"_fmt(i, TilePToGraphP[i]);
+			for (auto j = scorearray.begin(); j != scorearray.end(); ++j) {
+				const auto& [p1, p2, e1, e2, score] = *j;
+				if (not (p1 == i or p2 == i)) continue;
+				const Point t = (p1 == i) ? p1 : p2;
+				const Point target = (p1 == i) ? p2 : p1;
+				if (used.includes(target)) continue;
+				if (not minscore or score < (*minscore)->score) {
+					const auto [p, r] = GetP2PosAndRotate(TilePToGraphP[t], graph[TilePToGraphP[t]]->r, e1, e2);
+					if (graph[p])continue;
+					minscore = j;
+				}
+			}
+		}
+		const Point p1 = (used.includes((*minscore)->p1)) ? (*minscore)->p1 : (*minscore)->p2;
+		const int e1 = (used.includes((*minscore)->p1)) ? (*minscore)->e1 : (*minscore)->e2;
+		const Point p2 = (used.includes((*minscore)->p1)) ? (*minscore)->p2 : (*minscore)->p1;
+		const int e2 = (used.includes((*minscore)->p1)) ? (*minscore)->e2 : (*minscore)->e1;
+		const auto [p, r] = GetP2PosAndRotate(TilePToGraphP[p1], graph[TilePToGraphP[p1]]->r, e1, e2);
+		
+		graph[p] = Graph{ p2,r };
+		TilePToGraphP[p2] = p;
+		used << p2;
+	};
+
+
+	for ([[maybe_unused]] int _ : step(/**15/*/tiles.num_elements() - 1/**/)) {
+		updategraph();
 	}
 
-	Image im(image.size());
+	Image im(tile_size * graph.size());
 	DynamicTexture t(im);
 	while (System::Update())
 	{
-		const auto rotate1 = [](const Image& image, int r) {
-				switch (r) {
-				case 0:
-					return image.rotated180();
-				case 1:
-					return image.rotated90();
-				case 2:
-					return image;
-				case 3:
-					return image.rotated270();
-				}
-			};
-		const auto rotate2 = [](const Image& image, int r) {
-				switch (r) {
-				case 0:
-					return image;
-				case 1:
-					return image.rotated270();
-				case 2:
-					return image.rotated180();
-				case 3:
-					return image.rotated90();
-				}
-			};
-		for (auto i : step(Size(16, 5))) {
-			rotate1(tiles[scorearray[i.x + i.y * 16].p1], scorearray[i.x + i.y * 16].r1).overwrite(im, { tile_size.x * i.x,tile_size.y * i.y * 2 });
-			rotate2(tiles[scorearray[i.x + i.y * 16].p2], scorearray[i.x + i.y * 16].r2).overwrite(im, { tile_size.x * i.x,tile_size.y * (i.y * 2 + 1) });
+		const auto rotate= [](const Image& image, int r) {
+			switch (r) {
+			case 0:
+				return image;
+			case 1:
+				return image.rotated90();
+			case 2:
+				return image.rotated180();
+			case 3:
+				return image.rotated270();
+			}
+		};
+		for (const auto& i : step(graph.size())) {
+			if (const auto& n = graph[i]; n.has_value()) {
+				rotate(tiles[n->suffledpos], n->r).overwrite(im, tile_size* i);
+			}
 		}
 		t.fill(im);
-		t.draw();
+		t.scaled(0.3).draw();
+		//updategraph();
 	}
 }
