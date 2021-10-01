@@ -1,7 +1,10 @@
-#include<Siv3D.hpp> // OpenSiv3D v0.6.1
+#include<Siv3D.hpp>
 #include<Eigen/Core>
 using namespace Eigen;
 using namespace std;
+
+using TPoint = Point;
+using GPoint = Point;
 
 Eigen::Matrix<Eigen::Vector3d, Eigen::Dynamic, Eigen::Dynamic> ImageToMatrix(const Image& image) {
 	Eigen::Matrix<Eigen::Vector3d, Eigen::Dynamic, Eigen::Dynamic> ret(image.width(), image.height());
@@ -29,8 +32,8 @@ std::array<Eigen::MatrixX3d, 4> PickEdge(const Eigen::Matrix<Eigen::Vector3d, Ei
 	}
 	return ret;
 }
-pair<Point, int> GetP2PosAndRotate(const Point& p1, int p1r, int p1e, int p2e) {
-	return make_pair<Point, int>(p1 + s3d::Array<Point>{ Point::Up(), Point::Right(), Point::Down(), Point::Left() }[(p1r + p1e) % 4], (p1r + p1e + p2e + 2) % 4);
+pair<GPoint, int> GetP2PosAndRotate(const GPoint& p1, int p1r, int p1e, int p2e) {
+	return make_pair<GPoint, int>(p1 + s3d::Array<Point>{ Point::Up(), Point::Right(), Point::Down(), Point::Left() } [(p1r + p1e) % 4] , (p1r + p1e + p2e + 2) % 4);
 }
 
 class PPMInfo {
@@ -59,14 +62,15 @@ public:
 	}cost;
 };
 
-struct Graph {
-	Point suffledpos;
+struct GraphData {
+	TPoint p;
 	int r;
 };
 
 void Main()
 {
 	Window::SetStyle(WindowStyle::Sizable);
+	Scene::SetBackground(Scene::DefaultBackgroundColor);
 
 	constexpr StringView path = U"testcase/problem2.ppm";
 
@@ -83,75 +87,184 @@ void Main()
 		int e1, e2;
 		double score;
 	};
-	const auto score_calc = [&](const Point& p1, int d1, const Point& p2, int d2) {
-		return (edge[p1][d1] - edge[p2][d2].colwise().reverse()).rowwise().squaredNorm().sum();
+	const auto score_calc = [&](const TPoint& p1, int e1, const TPoint& p2, int e2) {
+		return (edge[p1][e1] - edge[p2][e2].colwise().reverse()).rowwise().squaredNorm().sum();
 	};
+
+	HashTable<TPoint, HashTable<TPoint, HashTable<int, HashTable<int, double>>>> scoretable;
 	s3d::Array<ScoreData> scorearray;
 	for (auto i : step(tiles.size())) {
 		for (auto j : step(tiles.size())) {
-			if (i.x < j.x or i.x == j.x and i.y < j.y) {
-				for(auto k : step(4)) {
-					for (int l : step(4)) {
-						scorearray << (ScoreData{ i,j,k,l,score_calc(i,k,j,l) });
+			for (auto k : step(4)) {
+				for (int l : step(4)) {
+					const double score = score_calc(i, k, j, l);
+					scoretable[i][j][k][l] = score;
+					scorearray << ScoreData{ i,j,k,l,score };
+				}
+			}
+		}
+	}
+
+	Grid<Optional<GraphData>> graph(64, 64);
+	graph[{32, 32}] = GraphData{ {0,0},0 };
+	const auto updategraph = [&] {
+		s3d::Array<TPoint> used;
+		for (const auto& i : graph) {
+			if (not i)continue;
+			used << i->p;
+		}
+		Logger << U"used.size()={}"_fmt(used.size());
+		Logger << used;
+
+		s3d::Array<ScoreData> data;
+		for (const auto& i : used) {
+			data.append(scorearray.removed_if([&](const ScoreData& d) {return not(d.p1 == i or d.p2 == i); }));
+		}
+		Logger << U"1:data.size()={}"_fmt(data.size());
+		data.remove_if([&](const ScoreData& d) {return used.includes(d.p1) and used.includes(d.p2); });
+		Logger << U"2:data.size()={}"_fmt(data.size());
+		if (data.empty()) {
+			Logger << U"data.empty()";
+			return false;
+		}
+		data.sort_by([](const ScoreData& d1, const ScoreData& d2) {return d1.score < d2.score; });
+
+		while (true) {
+			const ScoreData& minscore = data.front();
+			const TPoint own = used.includes(minscore.p1) ? minscore.p1 : minscore.p2;
+			const TPoint target = used.includes(minscore.p1) ? minscore.p2 : minscore.p1;
+			Logger << U"own={},target={}"_fmt(own, target);
+			const int owne = used.includes(minscore.p1) ? minscore.e1 : minscore.e2;
+			const int targete = used.includes(minscore.p1) ? minscore.e2 : minscore.e1;
+			GPoint owngp(-1, -1);
+			for (GPoint p : step(graph.size())) {
+				if (graph[p] and graph[p]->p == own) {
+					owngp = p;
+					break;
+				}
+			}
+			const auto [gp, r] = GetP2PosAndRotate(owngp, graph[owngp]->r, owne, targete);
+			if (graph[gp]) {
+				data.pop_front();
+				Logger << U"continue";
+				continue;
+			}
+			graph[gp] = GraphData{ target,r };
+			break;
+		}
+		return true;
+	};
+
+	s3d::Console << U"Step1";
+	for (auto n : step(tiles.num_elements() - 1)) {
+		if (not updategraph()) {
+			break;
+		}
+	}
+
+	Rect maxtile_region(0, 0, tiles.size());
+	int tilecount = 0;
+	for (auto i : step(Size(64, 64) - tiles.size() + Point(1, 1))) {
+		int count = 0;
+		for (auto j : step(i, tiles.size())) {
+			if (graph[j])count++;
+		}
+
+		if (tilecount < count) {
+			tilecount = count;
+			maxtile_region.pos = i;
+		}
+	}
+	for (auto i : step(graph.size())) {
+		if (not maxtile_region.intersects(i)) {
+			graph[i].reset();
+		}
+	}
+
+	s3d::Console << maxtile_region;
+
+	const auto updategraph2 = [&] {
+		s3d::Array<TPoint> used;
+		for (const auto& i : graph) {
+			if (not i)continue;
+			used << i->p;
+		}
+		Logger << U"used.size()={}"_fmt(used.size());
+		Logger << used;
+
+		s3d::Array<ScoreData> data;
+		for (const auto& i : used) {
+			data.append(scorearray.removed_if([&](const ScoreData& d) {return not(d.p1 == i or d.p2 == i); }));
+		}
+		Logger << U"1:data.size()={}"_fmt(data.size());
+		data.remove_if([&](const ScoreData& d) {return used.includes(d.p1) and used.includes(d.p2); });
+		Logger << U"2:data.size()={}"_fmt(data.size());
+		if (data.empty()) {
+			Logger << U"data.empty()";
+			return false;
+		}
+		data.sort_by([](const ScoreData& d1, const ScoreData& d2) {return d1.score < d2.score; });
+
+		while (true) {
+			const ScoreData& minscore = data.front();
+			const TPoint own = used.includes(minscore.p1) ? minscore.p1 : minscore.p2;
+			const TPoint target = used.includes(minscore.p1) ? minscore.p2 : minscore.p1;
+			Logger << U"own={},target={}"_fmt(own, target);
+			const int owne = used.includes(minscore.p1) ? minscore.e1 : minscore.e2;
+			const int targete = used.includes(minscore.p1) ? minscore.e2 : minscore.e1;
+			GPoint owngp(-1, -1);
+			for (GPoint p : step(graph.size())) {
+				if (graph[p] and graph[p]->p == own) {
+					owngp = p;
+					break;
+				}
+			}
+			const auto [gp, r] = GetP2PosAndRotate(owngp, graph[owngp]->r, owne, targete);
+			if (graph[gp] or not maxtile_region.intersects(gp)) {
+				data.pop_front();
+				Logger << U"continue";
+				continue;
+			}
+			graph[gp] = GraphData{ target,r };
+			break;
+		}
+		return true;
+	};
+
+	s3d::Console << U"Step2";
+	for (auto n : step(tiles.num_elements() - 1)) {
+		if (not updategraph2()) {
+			break;
+		}
+	}
+
+	Grid<GraphData> graph2(tiles.size());
+	for (auto i : step(graph2.size())) {
+		graph2[i] = *graph[maxtile_region.pos + i];
+	}
+
+	{
+		TextWriter writer(U"PLANA.txt", TextEncoding::UTF8_NO_BOM);
+		writer << info.divit.y << U' ' << info.divit.x;
+		writer << info.cost.select << U' ' << info.cost.swap;
+		for (const auto i : step(tiles.height())) {
+			String s;
+			for (const auto j : step(tiles.width())) {
+				for (const auto k : step(tiles.size())) {
+					if (graph2[k].p == Point(j, i)) {
+						s += U"{} {} {} "_fmt(k.y, k.x, graph2[k].r);
 					}
 				}
 			}
+			writer << s;
 		}
 	}
-	scorearray.sort_by([](const auto& a, const auto& b) {return a.score < b.score; });
-	list<ScoreData> scorelist(scorearray.begin(), scorearray.end());
 
-	{	//textfile output
-		TextWriter writer(U"Banana.txt");
-		for (const auto& i : scorelist)
-			writer.writeln(U"{},{},{},{},{}"_fmt(i.p1, i.p2, i.e1, i.e2, i.score));
-	}
-
-	Grid<Optional<Graph>> graph(32, 32);	//operator[]にはグラフ座標
-	Grid<Point> TilePToGraphP(tiles.size());
-	s3d::Array<Point> used;	//位置が決定したタイル座標
-	graph[{15, 15}] = Graph{ scorelist.front().p1,0 };
-	TilePToGraphP[scorelist.front().p1] = Point(15, 15);
-	used << scorelist.front().p1;
-
-	const auto updategraph = [&]() {
-		Optional<s3d::Array<ScoreData>::iterator> minscore;
-		for (const auto& i : used) {
-			Logger << U"タイル{},グラフ{}の周りを探します"_fmt(i, TilePToGraphP[i]);
-			for (auto j = scorearray.begin(); j != scorearray.end(); ++j) {
-				const auto& [p1, p2, e1, e2, score] = *j;
-				if (not (p1 == i or p2 == i)) continue;
-				const Point t = (p1 == i) ? p1 : p2;
-				const Point target = (p1 == i) ? p2 : p1;
-				if (used.includes(target)) continue;
-				if (not minscore or score < (*minscore)->score) {
-					const auto [p, r] = GetP2PosAndRotate(TilePToGraphP[t], graph[TilePToGraphP[t]]->r, e1, e2);
-					if (graph[p])continue;
-					minscore = j;
-				}
-			}
-		}
-		const Point p1 = (used.includes((*minscore)->p1)) ? (*minscore)->p1 : (*minscore)->p2;
-		const int e1 = (used.includes((*minscore)->p1)) ? (*minscore)->e1 : (*minscore)->e2;
-		const Point p2 = (used.includes((*minscore)->p1)) ? (*minscore)->p2 : (*minscore)->p1;
-		const int e2 = (used.includes((*minscore)->p1)) ? (*minscore)->e2 : (*minscore)->e1;
-		const auto [p, r] = GetP2PosAndRotate(TilePToGraphP[p1], graph[TilePToGraphP[p1]]->r, e1, e2);
-		
-		graph[p] = Graph{ p2,r };
-		TilePToGraphP[p2] = p;
-		used << p2;
-	};
-
-
-	for ([[maybe_unused]] int _ : step(/**15/*/tiles.num_elements() - 1/**/)) {
-		updategraph();
-	}
-
-	Image im(tile_size * graph.size());
+	Image im(tile_size * graph2.size());
 	DynamicTexture t(im);
 	while (System::Update())
 	{
-		const auto rotate= [](const Image& image, int r) {
+		const auto rotate = [](const Image& image, int r) {
 			switch (r) {
 			case 0:
 				return image;
@@ -163,13 +276,10 @@ void Main()
 				return image.rotated270();
 			}
 		};
-		for (const auto& i : step(graph.size())) {
-			if (const auto& n = graph[i]; n.has_value()) {
-				rotate(tiles[n->suffledpos], n->r).overwrite(im, tile_size* i);
-			}
+		for (const auto& i : step(graph2.size())) {
+			rotate(tiles[graph2[i].p], graph2[i].r).overwrite(im, tile_size * i);
 		}
 		t.fill(im);
-		t.scaled(0.3).draw();
-		//updategraph();
+		t.scaled(0.5).draw();
 	}
 }
